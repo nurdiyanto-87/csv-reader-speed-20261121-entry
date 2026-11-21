@@ -8,7 +8,9 @@
 // character at a time: an unquoted field is one slice up to the next comma or
 // line break (a stray CR is the only slow path), and a quoted field is one
 // slice up to the next quote (doubled quotes and embedded line breaks are the
-// only slow paths). No string is ever built a character at a time.
+// only slow paths). No string is ever built a character at a time, and no
+// object is allocated per field: one field's value, end and kept-character
+// count live in scratch variables the readers share.
 
 const COMMA = 0;
 const LINE_BREAK = 1;
@@ -31,30 +33,37 @@ export function run(input) {
   let recordLine = 1;
   let recordRow = null;
 
-  // Append chunk `s` to the field value held in `v` (a string, or an array of chunks).
-  function append(v, s) {
-    if (v.parts) {
-      v.parts.push(s);
-      return v;
+  // The field just read: its value, how it ended, and how many characters were
+  // kept onto it after it started (a quoted field's junk count, for quote_junk).
+  let fValue = '';
+  let fEnded = END;
+  let fAdded = 0;
+
+  // The field value being built: one string, or chunks to join when it comes in pieces.
+  let acc = '';
+  let accParts = null;
+
+  // Append chunk `s` to the field value being built.
+  function accAppend(s) {
+    if (accParts) {
+      accParts.push(s);
+    } else if (acc === '') {
+      acc = s;
+    } else {
+      accParts = [acc, s];
     }
-    if (v.value === '') {
-      v.value = s;
-      return v;
-    }
-    v.parts = [v.value, s];
-    return v;
   }
 
-  // The field value held in `v` as one string.
-  function valueOf(v) {
-    return v.parts ? v.parts.join('') : v.value;
+  // The field value being built, as one string.
+  function accValue() {
+    return accParts ? accParts.join('') : acc;
   }
 
   // Reads unquoted characters onto `init` up to the next comma or line break: a CR
-  // not followed by LF is dropped (stray_cr). Returns {value, ended, added};
-  // `added` counts the characters kept after `init`.
+  // not followed by LF is dropped (stray_cr). Leaves the field in fValue/fEnded/fAdded.
   function readUnquoted(init) {
-    const v = { value: init, parts: null };
+    acc = init;
+    accParts = null;
     let added = 0;
     for (;;) {
       const iC = text.indexOf(',', pos);
@@ -76,7 +85,7 @@ export function run(input) {
         // No CR in this chunk: it is one slice.
         if (end > pos) {
           added += end - pos;
-          append(v, text.slice(pos, end));
+          accAppend(text.slice(pos, end));
         }
         if (kind === COMMA) {
           pos = end + 1;
@@ -86,33 +95,39 @@ export function run(input) {
         } else {
           pos = n;
         }
-        return { value: valueOf(v), ended: kind, added };
+        fValue = accValue();
+        fEnded = kind;
+        fAdded = added;
+        return;
       }
       // A CR sits before the next comma or line break.
       if (text.charCodeAt(iR + 1) === 10) {
         // CRLF ends the field here; the CR is not part of it.
         if (iR > pos) {
           added += iR - pos;
-          append(v, text.slice(pos, iR));
+          accAppend(text.slice(pos, iR));
         }
         pos = iR + 2;
         line += 1;
-        return { value: valueOf(v), ended: LINE_BREAK, added };
+        fValue = accValue();
+        fEnded = LINE_BREAK;
+        fAdded = added;
+        return;
       }
       // A lone CR: dropped, and the field goes on after it.
       errors.push({ code: 'stray_cr', line: recordLine, row: recordRow });
       if (iR > pos) {
         added += iR - pos;
-        append(v, text.slice(pos, iR));
+        accAppend(text.slice(pos, iR));
       }
       pos = iR + 1;
     }
   }
 
-  // Appends the quoted segment [a, b) to `v`, turning each CRLF and lone CR in
-  // it into one LF and counting each as a line. The segment holds at least one
-  // CR or LF.
-  function appendQuotedSegment(v, a, b) {
+  // Appends the quoted segment [a, b) to the field value being built, turning
+  // each CRLF and lone CR in it into one LF and counting each as a line. The
+  // segment holds at least one CR or LF.
+  function appendQuotedSegment(a, b) {
     let p = a;
     for (;;) {
       const r = text.indexOf('\r', p);
@@ -126,21 +141,22 @@ export function run(input) {
         m = l;
       }
       if (m === -1) {
-        if (b > p) append(v, text.slice(p, b));
+        if (b > p) accAppend(text.slice(p, b));
         return;
       }
-      if (m > p) append(v, text.slice(p, m));
-      append(v, '\n');
+      if (m > p) accAppend(text.slice(p, m));
+      accAppend('\n');
       line += 1;
       p = isCR && text.charCodeAt(m + 1) === 10 ? m + 2 : m + 1;
     }
   }
 
-  // Reads a quoted field whose opening quote is at pos.
+  // Reads a quoted field whose opening quote is at pos. Leaves the field in fValue/fEnded/fAdded.
   function readQuoted() {
     const open = pos;
     const openLine = line;
-    const v = { value: '', parts: null };
+    acc = '';
+    accParts = null;
     pos += 1;
     for (;;) {
       const q = text.indexOf('"', pos);
@@ -150,45 +166,59 @@ export function run(input) {
         pos = open + 1;
         line = openLine;
         errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-        return readUnquoted('"');
+        readUnquoted('"');
+        return;
       }
       const r = text.indexOf('\r', pos);
       const l = text.indexOf('\n', pos);
       if ((r === -1 || r >= q) && (l === -1 || l >= q)) {
-        if (q > pos) append(v, text.slice(pos, q));
+        if (q > pos) accAppend(text.slice(pos, q));
       } else {
-        appendQuotedSegment(v, pos, q);
+        appendQuotedSegment(pos, q);
       }
       if (text.charCodeAt(q + 1) === 34) {
         // A doubled quote is one quote, and the field goes on.
-        append(v, '"');
+        accAppend('"');
         pos = q + 2;
         continue;
       }
       pos = q + 1;
       break;
     }
-    if (pos >= n) return { value: valueOf(v), ended: END };
+    if (pos >= n) {
+      fValue = accValue();
+      fEnded = END;
+      fAdded = 0;
+      return;
+    }
     const c = text.charCodeAt(pos);
     if (c === 44) {
       pos += 1;
-      return { value: valueOf(v), ended: COMMA };
+      fValue = accValue();
+      fEnded = COMMA;
+      fAdded = 0;
+      return;
     }
     if (c === 10) {
       pos += 1;
       line += 1;
-      return { value: valueOf(v), ended: LINE_BREAK };
+      fValue = accValue();
+      fEnded = LINE_BREAK;
+      fAdded = 0;
+      return;
     }
     if (c === 13 && text.charCodeAt(pos + 1) === 10) {
       pos += 2;
       line += 1;
-      return { value: valueOf(v), ended: LINE_BREAK };
+      fValue = accValue();
+      fEnded = LINE_BREAK;
+      fAdded = 0;
+      return;
     }
     // What follows the closing quote is appended as it stands, up to the next
     // comma or line break.
-    const junk = readUnquoted(valueOf(v));
-    if (junk.added > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
-    return junk;
+    readUnquoted(accValue());
+    if (fAdded > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
   }
 
   for (;;) {
@@ -210,13 +240,13 @@ export function run(input) {
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
     const fields = [];
-    let field;
     let quoted;
     do {
       quoted = text.charCodeAt(pos) === 34;
-      field = quoted ? readQuoted() : readUnquoted('');
-      fields.push(field.value);
-    } while (field.ended === COMMA);
+      if (quoted) readQuoted();
+      else readUnquoted('');
+      fields.push(fValue);
+    } while (fEnded === COMMA);
 
     // A line that held only stray CRs is left with no characters: no record (its stray_cr errors stay).
     if (fields.length === 1 && fields[0] === '' && !quoted) continue;
